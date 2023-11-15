@@ -40,10 +40,6 @@ func (b *Backend) IsAlive() bool {
 	return b.Alive
 }
 
-func (b *Backend) String() string {
-	return b.URL.String()
-}
-
 type ServerPool struct {
 	backends []*Backend
 	current  uint64
@@ -56,7 +52,7 @@ func (s *ServerPool) AddBackend(b *Backend) {
 func (s *ServerPool) HealthCheck() {
 	for _, b := range s.backends {
 		status := "up"
-		alive := isBackendAlive(b.URL)
+		alive := checkAlive(b.URL)
 		b.SetAlive(alive)
 		if !alive {
 			status = "down"
@@ -65,7 +61,7 @@ func (s *ServerPool) HealthCheck() {
 	}
 }
 
-func (s *ServerPool) SetBackendStatus(url *url.URL, alive bool) {
+func (s *ServerPool) SetBackendAlive(url *url.URL, alive bool) {
 	for _, b := range s.backends {
 		if b.URL.String() == url.String() {
 			b.SetAlive(alive)
@@ -94,8 +90,8 @@ func (s *ServerPool) GetNextPeer() *Backend {
 	return nil
 }
 
-// isBackendAlive 通过是否能建立 TCP 链接判断节点是否存活
-func isBackendAlive(u *url.URL) bool {
+// checkAlive 通过是否能建立 TCP 链接判断节点是否存活
+func checkAlive(u *url.URL) bool {
 	conn, err := net.DialTimeout("tcp", u.Host, 2*time.Second)
 
 	if err != nil {
@@ -167,7 +163,7 @@ func main() {
 	flag.Parse()
 
 	if len(servers) == 0 {
-		log.Fatal("Please provide one or more backends to load balance")
+		log.Fatal("No backend to load balance")
 	}
 
 	tokens := strings.Split(servers, ",")
@@ -190,8 +186,9 @@ func main() {
 				return
 			}
 			// 3 次重试后，标记该节点不可用
-			serverPool.SetBackendStatus(serverURL, false)
+			serverPool.SetBackendAlive(serverURL, false)
 
+			// 重新进行下一轮 load balance
 			attempt := GetAttemptFromContext(request)
 			log.Printf("%s(%s) Attempting retry %d\n", request.RemoteAddr, request.URL.Path, attempt)
 			ctx := context.WithValue(request.Context(), Attempt, attempt+1)
