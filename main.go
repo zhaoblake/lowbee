@@ -9,9 +9,9 @@ import (
 	"net/http"
 	"net/http/httputil"
 	"net/url"
+	"strconv"
 	"strings"
 	"sync"
-	"sync/atomic"
 	"time"
 )
 
@@ -23,6 +23,7 @@ const (
 type Backend struct {
 	URL          *url.URL
 	Alive        bool
+	Weight       int
 	ReverseProxy *httputil.ReverseProxy
 
 	mutex sync.RWMutex
@@ -34,6 +35,12 @@ func (b *Backend) SetAlive(alive bool) {
 	b.mutex.Unlock()
 }
 
+func (b *Backend) SetWeight(weight int) {
+	b.mutex.Lock()
+	b.Weight = weight
+	b.mutex.Unlock()
+}
+
 func (b *Backend) IsAlive() bool {
 	b.mutex.RLock()
 	defer b.mutex.RUnlock()
@@ -41,8 +48,9 @@ func (b *Backend) IsAlive() bool {
 }
 
 type ServerPool struct {
-	backends []*Backend
-	current  uint64
+	backends      []*Backend
+	currentWeight int
+	current       int
 }
 
 func (s *ServerPool) AddBackend(b *Backend) {
@@ -70,24 +78,66 @@ func (s *ServerPool) SetBackendAlive(url *url.URL, alive bool) {
 	}
 }
 
-func (s *ServerPool) NextIndex() int {
-	return int(atomic.AddUint64(&s.current, uint64(1)) % uint64(len(s.backends)))
+func (s *ServerPool) SetBackendWeight(url *url.URL, weight int) {
+	for _, b := range s.backends {
+		if b.URL.String() == url.String() {
+			b.SetWeight(weight)
+			break
+		}
+	}
 }
 
-// GetNextPeer 返回下一个活跃的节点处理请求
-func (s *ServerPool) GetNextPeer() *Backend {
-	next := s.NextIndex()
-	l := len(s.backends) + next
-	for i := next; i < l; i++ {
-		index := i % len(s.backends)
-		if s.backends[index].IsAlive() {
-			if i != next {
-				atomic.StoreUint64(&s.current, uint64(index))
+func (s *ServerPool) GetNextWeightedPeer() *Backend {
+	gcd := findGCD(s.backends)
+
+	for {
+		s.current = (s.current + 1) % len(s.backends)
+
+		if s.current == 0 {
+			s.currentWeight -= gcd
+
+			if s.currentWeight <= 0 {
+				s.currentWeight = maxWeight(s.backends)
 			}
-			return s.backends[index]
+
+			if s.currentWeight == 0 {
+				break
+			}
+		}
+
+		b := s.backends[s.current]
+		if b.Weight >= s.currentWeight && b.IsAlive() {
+			return b
 		}
 	}
 	return nil
+}
+
+func maxWeight(backends []*Backend) int {
+	maxWeight := 0
+	for _, b := range backends {
+		if b.Weight > maxWeight {
+			maxWeight = b.Weight
+		}
+	}
+	return maxWeight
+}
+
+// findGCD 寻找所有节点权重的最大公约数
+func findGCD(backends []*Backend) int {
+	gcd := backends[0].Weight
+	for _, b := range backends {
+		gcd = calculateGCD(gcd, b.Weight)
+	}
+	return gcd
+}
+
+func calculateGCD(a, b int) int {
+	if b != 0 {
+
+		a, b = b, a%b
+	}
+	return a
 }
 
 // checkAlive 通过是否能建立 TCP 链接判断节点是否存活
@@ -144,7 +194,7 @@ func lowbee(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	peer := serverPool.GetNextPeer()
+	peer := serverPool.GetNextWeightedPeer()
 	if peer != nil {
 		peer.ReverseProxy.ServeHTTP(w, r)
 		return
@@ -156,9 +206,11 @@ var serverPool ServerPool
 
 func main() {
 	var servers string
+	var weights string
 	var port int
 
 	flag.StringVar(&servers, "backends", "", "Load balanced backends, use commas to separate")
+	flag.StringVar(&weights, "weights", "", "weight of Load balanced backends, use commas to separate")
 	flag.IntVar(&port, "port", 3030, "Port to serve")
 	flag.Parse()
 
@@ -166,14 +218,21 @@ func main() {
 		log.Fatal("No backend to load balance")
 	}
 
-	tokens := strings.Split(servers, ",")
-	for _, token := range tokens {
+	serverTokens := strings.Split(servers, ",")
+	weightTokens := strings.Split(weights, ",")
+
+	if len(serverTokens) != len(weightTokens) {
+		log.Fatal("number of backends is not equal to number of weights")
+	}
+
+	for index, token := range serverTokens {
 		serverURL, err := url.Parse(token)
 		if err != nil {
 			log.Fatal(err)
 		}
 
 		proxy := httputil.NewSingleHostReverseProxy(serverURL)
+		// TODO: 失败后要降低对应 backend 的权重
 		proxy.ErrorHandler = func(writer http.ResponseWriter, request *http.Request, err error) {
 			log.Printf("[%s] %s\n", serverURL.Host, err.Error())
 			retry := GetRetryFromContext(request)
@@ -194,13 +253,23 @@ func main() {
 			ctx := context.WithValue(request.Context(), Attempt, attempt+1)
 			lowbee(writer, request.WithContext(ctx))
 		}
+
+		weight, err := strconv.Atoi(weightTokens[index])
+		if err != nil {
+			log.Fatal("wrong weight: ", weightTokens[index])
+		}
+
 		// 注册节点
 		serverPool.AddBackend(&Backend{
 			URL:          serverURL,
 			Alive:        true,
 			ReverseProxy: proxy,
+			Weight:       weight,
 		})
 	}
+	serverPool.currentWeight = maxWeight(serverPool.backends)
+	serverPool.current = -1
+
 	server := http.Server{
 		Addr:    fmt.Sprintf(":%d", port),
 		Handler: http.HandlerFunc(lowbee),

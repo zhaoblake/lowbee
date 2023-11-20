@@ -1,2 +1,2 @@
 # lowbee
-A simple load balancer for practice, this project is a replica of [simplelb](https://github.com/kasvith/simplelb).
+A simple load balancer with weighted round-robin algorithm, this project is totally inspired by [simplelb](https://github.com/kasvith/simplelb).
